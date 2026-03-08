@@ -31,12 +31,11 @@ def get_img_files(dir: str | Path) -> list:
     # Compile a list of image files:
     img_extensions = ('*.jpg', '*.jpeg', '*.tiff', '*.tif', '*.png')
     files_list = []
-    try:
-        for extension in img_extensions:
+    for extension in img_extensions:
+        try:
             files_list.extend([file for file in path.rglob(extension)])
-    except Exception as e:
-        print('Error finding files:', e)
-        return
+        except Exception as e:
+            print('Error finding files:', e)
 
     return files_list
 
@@ -62,8 +61,9 @@ def idb2_image_import(path: str | Path) -> tuple[Tensor, int]:
 
 
 class idb2_dataset(Dataset):
-    def __init__(self, img_dir: str | Path, transform=None,
-                 train: bool = True, split_ratio: float = 0.8):
+    def __init__(self, img_dir: str | Path = './data/ALL_IDB/ALL_IDB2',
+                 transform=None, train: bool = True,
+                 split_ratio: float = 0.8):
 
         self.transform = transform
 
