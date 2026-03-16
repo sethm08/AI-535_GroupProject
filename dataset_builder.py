@@ -4,9 +4,10 @@
 #       to the group project.
 
 from pathlib import Path
-from skimage.io import imread
+from PIL import Image
 from sklearn.model_selection import train_test_split
 from torch import tensor, Tensor
+from torchvision.transforms.functional import pil_to_tensor
 from torchvision.io import read_image
 from torch.utils.data import Dataset
 import numpy as np
@@ -57,11 +58,9 @@ def image_import(path: str | Path) -> Tensor:
     extension = path.rsplit('.', maxsplit=1)[1]
 
     if extension in ('jpg', 'jpeg', 'png'):
-        img_tensor = read_image(path=path)
+        return read_image(path=path)
     else:
-        img_tensor = tensor(imread(path))
-
-    return img_tensor
+        return pil_to_tensor(Image.open(path))
 
 
 class idb2_dataset(Dataset):
@@ -115,7 +114,7 @@ class idb2_dataset(Dataset):
 
 class bcicd_dataset(Dataset):
     def __init__(self, transform=None, train: bool = True,
-                 split_ratio: float = 0.8, dir: str | Path = './data/.cache'):
+                 split_ratio: float = 0.8, dir: str | Path = cache_path):
 
         self.transform = transform
 
@@ -123,7 +122,7 @@ class bcicd_dataset(Dataset):
         path = Path(
             kagglehub.dataset_download(
                 "sumithsingh/blood-cell-images-for-cancer-detection",
-                output_dir=str(cache_path)
+                output_dir=str(dir)
                 )
         )
 
