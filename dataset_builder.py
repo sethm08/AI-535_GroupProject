@@ -6,8 +6,9 @@
 from pathlib import Path
 from PIL import Image
 from sklearn.model_selection import train_test_split
-from torch import tensor, Tensor
+from torch import tensor, Tensor, from_numpy
 from torchvision.transforms.functional import pil_to_tensor
+from torchvision.ops import box_convert
 from torchvision.io import read_image
 from torch.utils.data import Dataset
 import numpy as np
@@ -173,6 +174,51 @@ class bcicd_dataset(Dataset):
         if self.transform:
             image = self.transform(image)
         return image, label
+
+
+class idb1_dataset(Dataset):
+    def __init__(self,
+                 dir_path: str | Path = './data/ALL_IDB/ALL_IDB1',
+                 transform=None, train: bool = True,
+                 split_ratio: float = 0.8):
+
+        self.transform = transform
+
+        self.dir_path = Path(dir_path)
+        print("Searching", self.dir_path)
+        img_files = list(self.dir_path.rglob('*.jpg'))
+        centroid_files = list(self.dir_path.rglob('*.xyc'))
+        img_files.sort()
+        centroid_files.sort()
+        print("Found", len(img_files), "images and", len(centroid_files), "centroid files.")
+
+        if len(img_files) != len(centroid_files):
+            raise AttributeError('Unequal number of image and centroid files.')
+        
+        count_list = [c.shape[0] for c in ]
+
+        # Split the train and test files so that the labels are balanced:
+        train_files, test_files = train_test_split(
+            img_files,
+            test_size=1.0 - split_ratio,
+            random_state=5,
+            stratify=labels
+        )
+
+        self.paired_paths = list(zip(img_files, centroid_files))
+
+    def __len__(self) -> int:
+        return len(self.paired_paths)
+
+    def __getitem__(self, idx) -> tuple[Tensor, Tensor]:
+        img_path, centroid_file = self.paired_paths[idx]
+        centroids = np.loadtxt(centroid_file, dtype=np.int16, delimiter='\t')
+        radius = 128
+        bboxes = tensor([[x, y, radius, radius] for x, y in centroids])
+        bboxes = box_convert(boxes=bboxes, in_fmt='cxcywh', out_fmt='xyxy')
+        image = image_import(img_path)
+
+        return image, bboxes
 
 
 def category_balance_plot(train_dataset: Dataset, test_dataset: Dataset):
