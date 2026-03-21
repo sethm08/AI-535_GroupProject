@@ -210,3 +210,4 @@ __marimo__/
 # WandB
 /wandb
 /models
+/test_predictions*

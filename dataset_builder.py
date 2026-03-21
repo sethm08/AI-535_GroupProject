@@ -3,9 +3,12 @@
 # Desc: This is to provide the tools to create datasets relative
 #       to the group project.
 
+import os
 from pathlib import Path
-from PIL import Image
+from typing import Tuple, Dict, Any, List
+from PIL import Image, ImageDraw
 from sklearn.model_selection import train_test_split
+import cv2
 import torch
 import torchvision.transforms.functional as TF
 from torchvision.transforms import InterpolationMode
@@ -456,6 +459,439 @@ class idb1_dataset(Dataset):
             return torch.empty((0, 4), dtype=torch.int16)
 
         return torch.tensor(boxes, dtype=torch.int16)
+
+
+class IDB1PatchTrainDataset(Dataset):
+    def __init__(
+        self,
+        dir_path: str | Path = "./data/ALL_IDB/ALL_IDB1",
+        split_ratio: float = 0.8,
+        random_state: int = 5,
+        patch_size: int = 512,
+        mask_radius: int = 12,
+        image_only_transform=None,
+        include_background_patches: bool = False,
+        background_per_image: int = 0,
+    ):
+        self.dir_path = Path(dir_path)
+        self.patch_size = patch_size
+        self.mask_radius = mask_radius
+        self.image_only_transform = image_only_transform
+        self.include_background_patches = include_background_patches
+        self.background_per_image = background_per_image
+
+        img_files = sorted(self.dir_path.rglob("*.jpg"))
+        centroid_files = sorted(self.dir_path.rglob("*.xyc"))
+
+        if len(img_files) != len(centroid_files):
+            raise AttributeError("Unequal number of image and centroid files.")
+
+        paired_paths = list(zip(img_files, centroid_files))
+
+        count_list = np.array([
+            self._load_centroids(c_file).shape[0]
+            for _, c_file in paired_paths
+        ], dtype=np.int32)
+
+        stratify_labels = self._build_stratify_labels(count_list)
+
+        train_files, test_files = train_test_split(
+            paired_paths,
+            test_size=1.0 - split_ratio,
+            random_state=random_state,
+            stratify=stratify_labels,
+        )
+
+        self.train_files = train_files
+
+        # Expand into per-patch samples
+        self.samples = []
+        rng = np.random.default_rng(random_state)
+
+        for img_path, centroid_file in self.train_files:
+            centroids = self._load_centroids(centroid_file)
+
+            # one patch per centroid
+            for i in range(centroids.shape[0]):
+                self.samples.append({
+                    "img_path": img_path,
+                    "centroid_file": centroid_file,
+                    "centroid_idx": i,
+                    "mode": "positive",
+                })
+
+            # optional background patches
+            if self.include_background_patches and self.background_per_image > 0:
+                for _ in range(self.background_per_image):
+                    self.samples.append({
+                        "img_path": img_path,
+                        "centroid_file": centroid_file,
+                        "centroid_idx": None,
+                        "mode": "background",
+                        "seed": int(rng.integers(0, 1_000_000)),
+                    })
+
+    def __len__(self):
+        return len(self.samples)
+
+    def __getitem__(self, idx) -> Tuple[torch.Tensor, Dict[str, Any]]:
+        sample = self.samples[idx]
+        img_path = sample["img_path"]
+        centroid_file = sample["centroid_file"]
+
+        image = image_import(img_path)  # expected CHW torch.Tensor
+        centroids = self._load_centroids(centroid_file)
+
+        instance_masks_full = self._mask_generator(image, centroids)   # (N,H,W)
+        semantic_mask_full = self._semantic_from_instances(instance_masks_full, image)
+
+        if sample["mode"] == "positive":
+            cx, cy = centroids[sample["centroid_idx"], :2]
+        else:
+            cx, cy = self._sample_background_center(
+                image=image,
+                centroids=centroids,
+                seed=sample["seed"]
+            )
+
+        patch_img, patch_sem, patch_inst, x0, y0 = self._crop_patch(
+            image=image,
+            semantic_mask=semantic_mask_full,
+            instance_masks=instance_masks_full,
+            cx=float(cx),
+            cy=float(cy),
+            patch_size=self.patch_size,
+        )
+
+        # recompute patch-local boxes / centroids from cropped masks
+        patch_boxes = self._boxes_from_masks(patch_inst)
+        patch_centroids = self._centroids_from_masks(patch_inst)
+
+        labels = torch.ones((patch_boxes.shape[0],), dtype=torch.long)
+
+        patch_img = patch_img.float()
+        if patch_img.max() > 1.0:
+            patch_img = patch_img / 255.0
+
+        if self.image_only_transform is not None:
+            patch_img = self.image_only_transform(patch_img)
+
+        target = {
+            "semantic_mask": patch_sem,        # (1,Hp,Wp)
+            "instance_masks": patch_inst,      # (N,Hp,Wp)
+            "boxes": patch_boxes,              # (N,4)
+            "centroids": patch_centroids,      # (N,2)
+            "labels": labels,
+            "patch_origin": torch.tensor([x0, y0], dtype=torch.float32),
+            "source_image": str(img_path),
+        }
+        return patch_img, target
+
+    def _load_centroids(self, file_path: str | Path) -> np.ndarray:
+        try:
+            if Path(file_path).stat().st_size == 0:
+                return np.empty((0, 2), dtype=np.int16)
+
+            centroids = np.loadtxt(file_path, dtype=np.int16, delimiter="\t")
+
+            if centroids.ndim == 1:
+                centroids = centroids.reshape(1, -1)
+
+            if centroids.shape[1] < 2:
+                return np.empty((0, 2), dtype=np.int16)
+
+            return centroids
+        except (OSError, ValueError, UserWarning):
+            return np.empty((0, 2), dtype=np.int16)
+
+    def _mask_generator(self, image: torch.Tensor, centroids: np.ndarray) -> torch.Tensor:
+        _, H, W = image.shape
+        if centroids.shape[0] == 0:
+            return torch.empty((0, H, W), dtype=torch.float32)
+
+        yy, xx = torch.meshgrid(
+            torch.arange(H, dtype=torch.float32),
+            torch.arange(W, dtype=torch.float32),
+            indexing="ij",
+        )
+        r2 = float(self.mask_radius ** 2)
+        masks = []
+
+        for row in centroids:
+            cx = float(row[0])
+            cy = float(row[1])
+
+            if cx < 0 or cy < 0 or cx >= W or cy >= H:
+                continue
+
+            disk = ((xx - cx) ** 2 + (yy - cy) ** 2) <= r2
+            masks.append(disk.float())
+
+        if len(masks) == 0:
+            return torch.empty((0, H, W), dtype=torch.float32)
+
+        return torch.stack(masks, dim=0)
+
+    def _semantic_from_instances(self, instance_masks: torch.Tensor,
+                                 image: torch.Tensor) -> torch.Tensor:
+        _, H, W = image.shape
+        if instance_masks.shape[0] == 0:
+            return torch.zeros((1, H, W), dtype=torch.float32)
+        return torch.amax(instance_masks, dim=0, keepdim=True)
+
+    def _crop_patch(
+        self,
+        image: torch.Tensor,
+        semantic_mask: torch.Tensor,
+        instance_masks: torch.Tensor,
+        cx: float,
+        cy: float,
+        patch_size: int,
+    ):
+        _, H, W = image.shape
+        half = patch_size // 2
+
+        x0 = max(0, int(round(cx)) - half)
+        y0 = max(0, int(round(cy)) - half)
+        x1 = min(W, x0 + patch_size)
+        y1 = min(H, y0 + patch_size)
+
+        # shift back if near edges
+        x0 = max(0, x1 - patch_size)
+        y0 = max(0, y1 - patch_size)
+
+        patch_img = image[:, y0:y1, x0:x1]
+        patch_sem = semantic_mask[:, y0:y1, x0:x1]
+
+        if instance_masks.shape[0] > 0:
+            patch_inst = instance_masks[:, y0:y1, x0:x1]
+            # keep only masks that have some positive pixels in this patch
+            keep = patch_inst.flatten(1).sum(dim=1) > 0
+            patch_inst = patch_inst[keep]
+        else:
+            patch_inst = torch.empty((0, y1 - y0, x1 - x0), dtype=torch.float32)
+
+        return patch_img, patch_sem, patch_inst, x0, y0
+
+    def _boxes_from_masks(self, masks: torch.Tensor) -> torch.Tensor:
+        boxes = []
+        for mask in masks:
+            ys, xs = torch.where(mask > 0)
+            if len(xs) == 0:
+                continue
+            boxes.append([xs.min().item(), ys.min().item(), xs.max().item(), ys.max().item()])
+        if len(boxes) == 0:
+            return torch.empty((0, 4), dtype=torch.float32)
+        return torch.tensor(boxes, dtype=torch.float32)
+
+    def _centroids_from_masks(self, masks: torch.Tensor) -> torch.Tensor:
+        cents = []
+        for mask in masks:
+            ys, xs = torch.where(mask > 0)
+            if len(xs) == 0:
+                continue
+            cents.append([xs.float().mean().item(), ys.float().mean().item()])
+        if len(cents) == 0:
+            return torch.empty((0, 2), dtype=torch.float32)
+        return torch.tensor(cents, dtype=torch.float32)
+
+    def _sample_background_center(self, image: torch.Tensor, centroids: np.ndarray, seed: int):
+        _, H, W = image.shape
+        rng = np.random.default_rng(seed)
+
+        for _ in range(100):
+            cx = rng.integers(self.patch_size // 2, max(self.patch_size // 2 + 1, W - self.patch_size // 2))
+            cy = rng.integers(self.patch_size // 2, max(self.patch_size // 2 + 1, H - self.patch_size // 2))
+
+            if centroids.shape[0] == 0:
+                return cx, cy
+
+            d2 = (centroids[:, 0] - cx) ** 2 + (centroids[:, 1] - cy) ** 2
+            if np.all(d2 > (2 * self.patch_size // 5) ** 2):
+                return cx, cy
+
+        # fallback
+        return W // 2, H // 2
+
+    def _build_stratify_labels(self, count_list: np.ndarray) -> np.ndarray:
+        bins = []
+        for c in count_list:
+            if c == 0:
+                bins.append("0")
+            elif c == 1:
+                bins.append("1")
+            elif c == 2:
+                bins.append("2")
+            elif c <= 4:
+                bins.append("3-4")
+            else:
+                bins.append("5+")
+        return np.array(bins)
+
+
+class IDB1FullImageTestDataset(Dataset):
+    def __init__(
+        self,
+        dir_path: str | Path = "./data/ALL_IDB/ALL_IDB1",
+        split_ratio: float = 0.8,
+        random_state: int = 5,
+        mask_radius: int = 12,
+        image_only_transform=None,
+    ):
+        self.dir_path = Path(dir_path)
+        self.mask_radius = mask_radius
+        self.image_only_transform = image_only_transform
+
+        img_files = sorted(self.dir_path.rglob("*.jpg"))
+        centroid_files = sorted(self.dir_path.rglob("*.xyc"))
+
+        if len(img_files) != len(centroid_files):
+            raise AttributeError("Unequal number of image and centroid files.")
+
+        paired_paths = list(zip(img_files, centroid_files))
+
+        count_list = np.array([
+            self._load_centroids(c_file).shape[0]
+            for _, c_file in paired_paths
+        ], dtype=np.int32)
+
+        stratify_labels = self._build_stratify_labels(count_list)
+
+        train_files, test_files = train_test_split(
+            paired_paths,
+            test_size=1.0 - split_ratio,
+            random_state=random_state,
+            stratify=stratify_labels,
+        )
+
+        self.test_files = test_files
+
+    def __len__(self):
+        return len(self.test_files)
+
+    def __getitem__(self, idx):
+        img_path, centroid_file = self.test_files[idx]
+
+        image = image_import(img_path)  # CHW
+        centroids = self._load_centroids(centroid_file)
+        instance_masks = self._mask_generator(image, centroids)
+        semantic_mask = self._semantic_from_instances(instance_masks, image)
+        boxes = self._boxes_from_masks(instance_masks)
+        centroids_t = self._centroids_from_masks(instance_masks)
+        labels = torch.ones((boxes.shape[0],), dtype=torch.long)
+
+        image = image.float()
+        if image.max() > 1.0:
+            image = image / 255.0
+
+        if self.image_only_transform is not None:
+            image = self.image_only_transform(image)
+
+        target = {
+            "semantic_mask": semantic_mask,
+            "instance_masks": instance_masks,
+            "boxes": boxes,
+            "centroids": centroids_t,
+            "labels": labels,
+            "image_path": str(img_path),
+        }
+        return image, target
+
+    # reuse same helper methods
+    _load_centroids = IDB1PatchTrainDataset._load_centroids
+    _mask_generator = IDB1PatchTrainDataset._mask_generator
+    _semantic_from_instances = IDB1PatchTrainDataset._semantic_from_instances
+    _boxes_from_masks = IDB1PatchTrainDataset._boxes_from_masks
+    _centroids_from_masks = IDB1PatchTrainDataset._centroids_from_masks
+    _build_stratify_labels = IDB1PatchTrainDataset._build_stratify_labels
+
+
+def full_image_collate_fn(batch):
+    assert len(batch) == 1, "Use batch_size=1 for full-resolution test inference."
+    return batch[0]
+
+
+def predicted_mask_to_boxes(pred_mask: torch.Tensor, min_area: int = 20):
+    """
+    pred_mask: (1,H,W) or (H,W), binary
+    returns Tensor (N,4) in xyxy
+    """
+    if pred_mask.ndim == 3:
+        pred_mask = pred_mask.squeeze(0)
+
+    mask_np = pred_mask.detach().cpu().numpy().astype(np.uint8)
+
+    num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(mask_np, connectivity=8)
+
+    boxes = []
+    for i in range(1, num_labels):   # skip background
+        x, y, w, h, area = stats[i]
+        if area < min_area:
+            continue
+        boxes.append([x, y, x + w, y + h])
+
+    if len(boxes) == 0:
+        return torch.empty((0, 4), dtype=torch.float32)
+
+    return torch.tensor(boxes, dtype=torch.float32)
+
+
+def save_box_visualization(
+    image: torch.Tensor,                 # (C,H,W), assumed float [0,1]
+    true_boxes: torch.Tensor,            # (N,4)
+    pred_boxes: torch.Tensor,            # (M,4)
+    save_path: str,
+):
+    img = image.detach().cpu().clone()
+    if img.max() <= 1.0:
+        img = (img * 255.0).clamp(0, 255)
+
+    img = img.byte().permute(1, 2, 0).numpy()
+    pil_img = Image.fromarray(img)
+    draw = ImageDraw.Draw(pil_img)
+
+    # green = true
+    for box in true_boxes:
+        x1, y1, x2, y2 = [float(v) for v in box]
+        draw.rectangle([x1, y1, x2, y2], outline="lime", width=3)
+
+    # red = predicted
+    for box in pred_boxes:
+        x1, y1, x2, y2 = [float(v) for v in box]
+        draw.rectangle([x1, y1, x2, y2], outline="red", width=3)
+
+    pil_img.save(save_path)
+
+
+def patch_collate_fn(batch):
+    images = []
+    semantic_masks = []
+    instance_masks = []
+    boxes = []
+    centroids = []
+    labels = []
+    patch_origins = []
+    source_images = []
+
+    for image, target in batch:
+        images.append(image)
+        semantic_masks.append(target["semantic_mask"])
+        instance_masks.append(target["instance_masks"])
+        boxes.append(target["boxes"])
+        centroids.append(target["centroids"])
+        labels.append(target["labels"])
+        patch_origins.append(target["patch_origin"])
+        source_images.append(target["source_image"])
+
+    return torch.stack(images), {
+        "semantic_mask": torch.stack(semantic_masks),
+        "instance_masks": instance_masks,
+        "boxes": boxes,
+        "centroids": centroids,
+        "labels": labels,
+        "patch_origin": patch_origins,
+        "source_image": source_images,
+    }
 
 
 def idb1_collate_fn(batch):
