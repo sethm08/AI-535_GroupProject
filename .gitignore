@@ -211,3 +211,6 @@ __marimo__/
 /wandb
 /models
 /test_predictions*
+
+# ALL-IDB
+/data/ALL_IDB/
